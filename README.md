@@ -23,6 +23,7 @@ Due to Discord's recent anti-bot updates, automated API reward claiming (`/claim
 
 ## ✨ Features
 
+- **📝 Auto-Discovery & Auto-Enroll:** Automatically detects and accepts all available quests without needing to click "Accept Quest" in Discord first.
 - **🔄 Automatic Queue Batching (`MAX_CONCURRENT = 2`):** Processes quests 2 at a time for safety.
 - **🛡️ Captcha-Safe Manual Claiming:** Zero risk of automated claim bot flags.
 - **⏱️ Natural 1x Speed for Video Quests:** Real wall-clock elapsed time matching.

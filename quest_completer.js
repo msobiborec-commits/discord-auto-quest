@@ -1,7 +1,9 @@
 /**
- * Discord Quest Parallel Auto-Completer (Captcha-Safe Queue Engine)
+ * Discord Quest Parallel Auto-Completer (Captcha-Safe Queue Engine + Auto-Enroll)
  * 
  * Features:
+ *   - Auto-Discovery & Auto-Enroll: Automatically fetches and accepts all new quests
+ *     (both in Discord's API and internal Flux stores).
  *   - MAX_CONCURRENT = 2: Runs at most 2 quests at a time for maximum safety.
  *   - Manual Captcha Claiming: Due to Discord's updated captcha protection, rewards
  *     are claimed manually by the user in the official UI.
@@ -46,34 +48,145 @@
         return;
     }
 
+    // Helper: Normalize quest objects between API (snake_case) and Discord Flux store (camelCase)
+    function normalizeQuest(q) {
+        if (!q || !q.config) return q;
+        q.config.expiresAt = q.config.expiresAt || q.config.expires_at;
+        q.config.taskConfig = q.config.taskConfig || q.config.taskConfigV2 || q.config.task_config || q.config.task_config_v2;
+        q.config.taskConfigV2 = q.config.taskConfigV2 || q.config.task_config_v2 || q.config.taskConfig;
+        if (q.config.messages) {
+            q.config.messages.questName = q.config.messages.questName || q.config.messages.quest_name;
+        }
+        const us = q.userStatus || q.user_status;
+        if (us) {
+            us.enrolledAt = us.enrolledAt || us.enrolled_at;
+            us.completedAt = us.completedAt || us.completed_at;
+            us.claimedAt = us.claimedAt || us.claimed_at;
+            q.userStatus = us;
+            q.user_status = us;
+        }
+        return q;
+    }
+
+    // Step 1: Force fetch all available quests directly from Discord API
+    console.log("%c[Safe Quest Completer] Fetching newest quests from Discord API...", "color: #00B0F4;");
+    let fetchedQuests = [];
+    try {
+        const meRes = await api.get({ url: "/quests/@me" });
+        fetchedQuests = meRes.body?.quests || [];
+        if (fetchedQuests.length > 0) {
+            try {
+                FluxDispatcher.dispatch({
+                    type: "QUESTS_FETCH_CURRENT_QUESTS_SUCCESS",
+                    quests: fetchedQuests
+                });
+            } catch (e) {}
+        }
+    } catch (e) {
+        console.warn("[Safe Quest Completer] Could not refresh /quests/@me directly, falling back to cached store.");
+    }
+
     const supportedTasks = ["WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY"];
     const isApp = typeof DiscordNative !== "undefined";
     const now = Date.now();
 
-    // Fetch active quests that are not yet claimed
-    let allQuests = [...QuestsStore.quests.values()].filter(x => {
+    // Helper: Auto-enroll in quest with full store synchronization
+    async function enrollInQuest(q) {
+        normalizeQuest(q);
+        const qName = q.config?.messages?.questName || q.config?.name || "Quest";
+        try {
+            console.log(`%c[Safe Quest Completer] 📝 Auto-accepting quest: '${qName}'...`, "color: #FEE75C; font-weight: bold;");
+            const res = await api.post({ url: `/quests/${q.id}/enroll`, body: { location: 1 } });
+            const statusObj = res.body?.enrolled_at ? res.body : (res.body?.user_status || res.body || {});
+            
+            // Normalize snake_case and camelCase
+            if (!statusObj.enrolledAt && statusObj.enrolled_at) statusObj.enrolledAt = statusObj.enrolled_at;
+            if (!statusObj.enrolled_at && statusObj.enrolledAt) statusObj.enrolled_at = statusObj.enrolledAt;
+            if (!statusObj.enrolledAt && !statusObj.enrolled_at) {
+                statusObj.enrolledAt = statusObj.enrolled_at = new Date().toISOString();
+            }
+
+            // Mutate in-memory quest object
+            q.userStatus = statusObj;
+            q.user_status = statusObj;
+
+            // Mutate QuestsStore in Discord
+            const liveQ = (QuestsStore.quests instanceof Map ? QuestsStore.quests.get(q.id) : QuestsStore.quests?.[q.id]) || QuestsStore.getQuest?.(q.id);
+            if (liveQ) {
+                liveQ.userStatus = statusObj;
+                liveQ.user_status = statusObj;
+            }
+
+            // Dispatch to FluxDispatcher so Discord internal Quest Tracker recognizes enrollment and sends heartbeats
+            try {
+                FluxDispatcher.dispatch({
+                    type: "QUESTS_ENROLL_SUCCESS",
+                    questId: q.id,
+                    userStatus: statusObj,
+                    quest: liveQ || q
+                });
+            } catch (e) {}
+
+            console.log(`%c[Safe Quest Completer] ✅ Quest '${qName}' accepted and activated!`, "color: #57F287; font-weight: bold;");
+            await new Promise(r => setTimeout(r, 1000));
+            return true;
+        } catch (err) {
+            console.error(`[Safe Quest Completer] Could not auto-enroll in '${qName}':`, err?.message || err);
+            return false;
+        }
+    }
+
+    // Step 2: Combine quests from QuestsStore and API fetch
+    const questMap = new Map();
+    const storeQuests = QuestsStore.quests instanceof Map
+        ? Array.from(QuestsStore.quests.values())
+        : (QuestsStore.quests ? Object.values(QuestsStore.quests) : []);
+
+    for (const q of storeQuests) {
+        if (q && q.id) questMap.set(q.id, normalizeQuest(q));
+    }
+    for (const q of fetchedQuests) {
+        if (q && q.id) {
+            if (!questMap.has(q.id)) {
+                questMap.set(q.id, normalizeQuest(q));
+            } else {
+                const existing = questMap.get(q.id);
+                normalizeQuest(existing);
+                normalizeQuest(q);
+                if (q.userStatus && !existing.userStatus) {
+                    existing.userStatus = q.userStatus;
+                    existing.user_status = q.user_status;
+                }
+            }
+        }
+    }
+
+    // Step 3: Filter active, supported, uncompleted/unclaimed quests
+    let allQuests = Array.from(questMap.values()).filter(x => {
         if (!x?.config) return false;
-        const exp = new Date(x.config.expiresAt).getTime();
-        if (exp <= now) return false;
-        if (x.userStatus?.claimedAt) return false;
-        const taskCfg = x.config.taskConfig ?? x.config.taskConfigV2;
+        const exp = new Date(x.config.expiresAt || x.config.expires_at).getTime();
+        if (isNaN(exp) || exp <= now) return false;
+        
+        const uStatus = x.userStatus || x.user_status;
+        const isClaimed = !!(uStatus?.claimedAt || uStatus?.claimed_at);
+        if (isClaimed) return false;
+
+        const taskCfg = x.config.taskConfig || x.config.taskConfigV2 || x.config.task_config || x.config.task_config_v2;
         if (!taskCfg?.tasks) return false;
+
         return supportedTasks.some(t => Object.keys(taskCfg.tasks).includes(t));
     });
 
     if (allQuests.length === 0) {
-        alert("🎉 All available quests are already completed and claimed!");
+        showToast("🎉 All Quests Completed", "All available quests are already completed and claimed!");
         return;
     }
 
-    // Auto-enroll in all available quests
+    // Auto-enroll in all available un-enrolled quests
     for (const q of allQuests) {
-        if (!q.userStatus?.enrolledAt) {
-            const qName = q.config.messages?.questName ?? "Quest";
-            try {
-                console.log(`%c[Safe Quest Completer] Enrolling in '${qName}'...`, "color: #FEE75C;");
-                await api.post({url: `/quests/${q.id}/enroll`, body: {location: 1}});
-            } catch (e) {}
+        const isEnrolled = !!(q.userStatus?.enrolledAt || q.userStatus?.enrolled_at);
+        if (!isEnrolled) {
+            await enrollInQuest(q);
         }
     }
 
@@ -81,7 +194,7 @@
     const queue = [...allQuests];
     const totalCount = queue.length;
 
-    console.log(`%c🛡️ [Safe Quest Completer] Loaded ${totalCount} quest(s). Max ${MAX_CONCURRENT} active at a time. Manual captcha-safe claiming enabled.`, "color: #57F287; font-size: 14px; font-weight: bold;");
+    console.log(`%c🛡️ [Safe Quest Completer] Loaded ${totalCount} quest(s). Max ${MAX_CONCURRENT} active at a time. Auto-enroll and manual captcha-safe claiming active.`, "color: #57F287; font-size: 14px; font-weight: bold;");
 
     // Multi-game RunningGameStore manager
     const originalGetRunningGames = RunningGameStore.getRunningGames;
@@ -98,6 +211,35 @@
             added: fakeList,
             games: fakeList
         });
+    }
+
+    // Non-blocking Discord styled toast notification
+    function showToast(title, body) {
+        try {
+            const containerId = "__discord_quest_toasts";
+            let container = document.getElementById(containerId);
+            if (!container) {
+                container = document.createElement("div");
+                container.id = containerId;
+                container.style.cssText = "position: fixed; top: 30px; right: 30px; z-index: 1000000; display: flex; flex-direction: column; gap: 10px; pointer-events: none;";
+                document.body.appendChild(container);
+            }
+            const toast = document.createElement("div");
+            toast.style.cssText = "background: #2b2d31; color: #f2f3f5; border: 1px solid #5865f2; border-left: 6px solid #57f287; border-radius: 8px; padding: 14px 18px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); font-family: 'gg sans', 'Noto Sans', sans-serif; pointer-events: auto; max-width: 380px; transition: opacity 0.3s ease, transform 0.3s ease; opacity: 0; transform: translateY(-10px);";
+            toast.innerHTML = `<div style="font-weight: bold; font-size: 14px; margin-bottom: 4px; color: #57f287;">${title}</div><div style="font-size: 13px; line-height: 1.4; color: #dbdee1;">${body}</div>`;
+            container.appendChild(toast);
+            requestAnimationFrame(() => {
+                toast.style.opacity = "1";
+                toast.style.transform = "translateY(0)";
+            });
+            setTimeout(() => {
+                toast.style.opacity = "0";
+                toast.style.transform = "translateY(-10px)";
+                setTimeout(() => toast.remove(), 400);
+            }, 8000);
+        } catch (e) {
+            console.log(`[Toast] ${title}: ${body}`);
+        }
     }
 
     // Notification sound for user when quest hits 100%
@@ -117,13 +259,14 @@
 
     // Waits for the user to solve captcha and click "Claim Reward" in Discord UI
     function waitForUserToClaimReward(quest) {
-        const questName = quest.config.messages?.questName ?? quest.id;
+        normalizeQuest(quest);
+        const questName = quest.config?.messages?.questName || quest.id;
         console.log(`%c🔔 [${questName}] 100% COMPLETE! Waiting for user to claim reward & solve captcha in Discord...`, "color: #57F287; font-size: 14px; font-weight: bold;");
         
         playNotificationSound();
 
-        // Inform user via alert
-        alert(`🎉 Quest Completed (100%): [${questName}]!\n\n👉 Please open your Discord Quests tab, click 'Claim Reward' and solve the captcha.\n\nOnce you claim it, the script will automatically detect it and launch the next quest from the queue!`);
+        // Non-blocking toast notification so Electron UI & hCaptcha modal are never blocked
+        showToast(`🎉 Quest 100%: ${questName}`, "Open Discord Quests / Gift Inventory, click 'Claim Reward' and solve captcha. Next quest starts automatically!");
 
         return new Promise((resolve) => {
             let claimListener = (data) => {
@@ -134,8 +277,9 @@
             };
 
             let pollInterval = setInterval(() => {
-                const liveQuest = QuestsStore.getQuest ? QuestsStore.getQuest(quest.id) : QuestsStore.quests?.get(quest.id);
-                if (liveQuest?.userStatus?.claimedAt) {
+                const liveQuest = QuestsStore.getQuest ? QuestsStore.getQuest(quest.id) : (QuestsStore.quests instanceof Map ? QuestsStore.quests.get(quest.id) : QuestsStore.quests?.[quest.id]);
+                const uStatus = liveQuest?.userStatus || liveQuest?.user_status;
+                if (uStatus?.claimedAt || uStatus?.claimed_at) {
                     cleanup();
                     resolve();
                 }
@@ -152,21 +296,36 @@
     }
 
     // Single quest execution wrapper
-    function executeQuest(quest) {
+    async function executeQuest(quest) {
+        normalizeQuest(quest);
+        const questName = quest.config?.messages?.questName || "Quest";
+
+        // Double check auto-enrollment before running tasks
+        const isEnrolled = !!(quest.userStatus?.enrolledAt || quest.userStatus?.enrolled_at);
+        if (!isEnrolled) {
+            await enrollInQuest(quest);
+        }
+
         return new Promise((resolve) => {
             try {
                 const pid = Math.floor(Math.random() * 30000) + 1000;
-                const questName = quest.config.messages?.questName ?? "Quest";
-                const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-                const taskName = supportedTasks.find(x => taskConfig.tasks[x] != null);
-                const taskData = taskConfig.tasks[taskName];
+                const taskConfig = quest.config.taskConfig || quest.config.taskConfigV2 || quest.config.task_config || quest.config.task_config_v2;
+                const taskName = supportedTasks.find(x => taskConfig?.tasks?.[x] != null);
+                const taskData = taskConfig?.tasks?.[taskName];
+
+                if (!taskName || !taskData) {
+                    console.warn(`[${questName}] Unknown or unsupported task format.`);
+                    return resolve();
+                }
 
                 const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
                 const secondsNeeded = taskData.target;
-                let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+                const uStatus = quest.userStatus || quest.user_status;
+                let secondsDone = uStatus?.progress?.[taskName]?.value ?? 0;
 
                 // If already reached 100% but not claimed
-                if (secondsDone >= secondsNeeded || quest.userStatus?.completedAt) {
+                const isCompleted = !!(uStatus?.completedAt || uStatus?.completed_at);
+                if (secondsDone >= secondsNeeded || isCompleted) {
                     waitForUserToClaimReward(quest).then(() => resolve());
                     return;
                 }
@@ -232,9 +391,15 @@
 
                         let fn = async (data) => {
                             if (data.questId !== quest.id) return;
-                            let progress = quest.config.configVersion === 1 
-                                ? data.userStatus.streamProgressSeconds 
-                                : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+                            const status = data.userStatus || data.user_status;
+                            let progress = 0;
+                            if (status?.progress?.PLAY_ON_DESKTOP?.value != null) {
+                                progress = Math.floor(status.progress.PLAY_ON_DESKTOP.value);
+                            } else if (status?.streamProgressSeconds != null) {
+                                progress = status.streamProgressSeconds;
+                            } else if (status?.stream_progress_seconds != null) {
+                                progress = status.stream_progress_seconds;
+                            }
 
                             const mins = Math.floor(progress / 60);
                             const secs = progress % 60;
@@ -275,7 +440,15 @@
 
                     let fn = async (data) => {
                         if (data.questId !== quest.id) return;
-                        let progress = quest.config.configVersion === 1 ? data.userStatus.streamProgressSeconds : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+                        const status = data.userStatus || data.user_status;
+                        let progress = 0;
+                        if (status?.progress?.STREAM_ON_DESKTOP?.value != null) {
+                            progress = Math.floor(status.progress.STREAM_ON_DESKTOP.value);
+                        } else if (status?.streamProgressSeconds != null) {
+                            progress = status.streamProgressSeconds;
+                        } else if (status?.stream_progress_seconds != null) {
+                            progress = status.stream_progress_seconds;
+                        }
                         console.log(`[${questName}] Stream progress: ${progress}/${secondsNeeded}s`);
 
                         if (progress >= secondsNeeded) {
@@ -326,7 +499,8 @@
     async function worker(workerId) {
         while (queue.length > 0) {
             const nextQuest = queue.shift();
-            const qName = nextQuest.config.messages?.questName ?? "Quest";
+            normalizeQuest(nextQuest);
+            const qName = nextQuest.config?.messages?.questName || "Quest";
             console.log(`%c[Worker #${workerId}] 🚀 Starting quest: '${qName}' (${queue.length} remaining in queue)`, "color: #5865F2; font-weight: bold;");
             await executeQuest(nextQuest);
             // Brief natural pause (3 seconds) between quests
@@ -341,5 +515,5 @@
     }
 
     await Promise.all(workerPromises);
-    alert("🎉 All quests have been completed and claimed! Great job!");
+    showToast("🎉 All Quests Done!", "All quests have been completed and claimed! Great job!");
 })();
